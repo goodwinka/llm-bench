@@ -490,7 +490,7 @@ def main():
     print_report(summary)
 
     out_path = args.output or f"results_{args.model}_{int(time.time())}.json"
-    with open(out_path, "w") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
     print(f"Results saved to {out_path}")
 

@@ -28,6 +28,7 @@ Suites:
 
 import argparse
 import json
+import sqlite3
 import sys
 import time
 import os
@@ -49,11 +50,13 @@ except ImportError:
 
 # ─── Defaults ────────────────────────────────────────────────────────────────
 
-DEFAULT_BASE_URL = "http://localhost:11434/v1"
-DEFAULT_WORKERS  = 1
-DEFAULT_TIMEOUT  = 15
-DEFAULT_SEED     = -1
-DEFAULT_SUITES   = ["cruxeval", "mmlu_cs"]
+DEFAULT_BASE_URL   = "http://localhost:11434/v1"
+DEFAULT_WORKERS    = 1
+DEFAULT_TIMEOUT    = 15
+DEFAULT_SEED       = -1
+DEFAULT_SUITES     = ["cruxeval", "mmlu_cs"]
+DEFAULT_TEMPERATURE = 1.0
+DEFAULT_DB         = "bench_stats.db"
 
 
 # ─── Suite Registry ──────────────────────────────────────────────────────────
@@ -290,7 +293,8 @@ def load_mmlu_ml(limit=None, **kw):
 
 # ─── LLM Client ──────────────────────────────────────────────────────────────
 
-def query_llm(base_url, model, prompt, system="", timeout=DEFAULT_TIMEOUT, seed=DEFAULT_SEED):
+def query_llm(base_url, model, prompt, system="", timeout=DEFAULT_TIMEOUT, seed=DEFAULT_SEED,
+              temperature=DEFAULT_TEMPERATURE):
     url = f"{base_url.rstrip('/')}/chat/completions"
     messages = []
     if system:
@@ -300,7 +304,7 @@ def query_llm(base_url, model, prompt, system="", timeout=DEFAULT_TIMEOUT, seed=
     body = {
         "model": model,
         "messages": messages,
-        "temperature": 1.0,
+        "temperature": temperature,
         "seed": seed,
     }
 
@@ -368,7 +372,8 @@ SYSTEM_PROMPT = (
 )
 
 
-def run_benchmark(base_url, model, questions, workers=DEFAULT_WORKERS, verbose=False, seed=DEFAULT_SEED, timeout=DEFAULT_TIMEOUT):
+def run_benchmark(base_url, model, questions, workers=DEFAULT_WORKERS, verbose=False, seed=DEFAULT_SEED,
+                  timeout=DEFAULT_TIMEOUT, temperature=DEFAULT_TEMPERATURE):
     total = len(questions)
     results = []
     correct = 0
@@ -383,7 +388,8 @@ def run_benchmark(base_url, model, questions, workers=DEFAULT_WORKERS, verbose=F
 
     def process(iq):
         i, q = iq
-        resp = query_llm(base_url, model, q["prompt"], SYSTEM_PROMPT, timeout=timeout, seed=seed)
+        resp = query_llm(base_url, model, q["prompt"], SYSTEM_PROMPT, timeout=timeout, seed=seed,
+                         temperature=temperature)
         ok = check_answer(q["expected"], resp["answer"], q["task"]) if not resp["error"] else False
         return i, q, resp, ok
 
@@ -424,7 +430,8 @@ def run_benchmark(base_url, model, questions, workers=DEFAULT_WORKERS, verbose=F
             record(done_n, *process(item))
 
     return {
-        "model": model, "total": total, "correct": correct,
+        "model": model, "temperature": temperature, "seed": seed,
+        "total": total, "correct": correct,
         "accuracy": correct / total if total else 0,
         "errors": errors,
         "avg_latency": total_latency / total if total else 0,
@@ -434,7 +441,7 @@ def run_benchmark(base_url, model, questions, workers=DEFAULT_WORKERS, verbose=F
 
 def print_report(s):
     print(f"\n\n{'='*65}")
-    print(f"  RESULTS — {s['model']}")
+    print(f"  RESULTS — {s['model']}  (temperature={s.get('temperature', '?')})")
     print(f"{'='*65}")
     print(f"  Total:  {s['correct']}/{s['total']}  ({s['accuracy']*100:.1f}%)  "
           f"avg {s['avg_latency']:.2f}s/question")
@@ -450,11 +457,244 @@ def print_report(s):
     print(f"{'='*65}\n")
 
 
+# ─── Database ────────────────────────────────────────────────────────────────
+
+def init_db(db_path):
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS runs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            model       TEXT    NOT NULL,
+            temperature REAL    NOT NULL,
+            seed        INTEGER,
+            timestamp   INTEGER NOT NULL,
+            suites      TEXT,
+            total       INTEGER,
+            correct     INTEGER,
+            accuracy    REAL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS question_results (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id      INTEGER NOT NULL REFERENCES runs(id),
+            question_id TEXT    NOT NULL,
+            suite       TEXT    NOT NULL,
+            task        TEXT    NOT NULL,
+            correct     INTEGER NOT NULL,
+            latency     REAL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_qr_question ON question_results(question_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_qr_suite    ON question_results(suite)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_model  ON runs(model, temperature)")
+    conn.commit()
+    return conn
+
+
+def save_to_db(db_path, summary, timestamp):
+    conn = init_db(db_path)
+    try:
+        cur = conn.cursor()
+        suites_json = json.dumps(sorted(summary["by_suite"].keys()))
+        cur.execute(
+            "INSERT INTO runs (model, temperature, seed, timestamp, suites, total, correct, accuracy) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (summary["model"], summary["temperature"], summary["seed"],
+             timestamp, suites_json,
+             summary["total"], summary["correct"], summary["accuracy"]),
+        )
+        run_id = cur.lastrowid
+        cur.executemany(
+            "INSERT INTO question_results (run_id, question_id, suite, task, correct, latency) "
+            "VALUES (?,?,?,?,?,?)",
+            [
+                (run_id, r["id"], r["suite"], r["task"], int(r["correct"]), r["latency"])
+                for r in summary["results"]
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ─── Statistics ───────────────────────────────────────────────────────────────
+
+def print_stats(db_path, model=None, suite=None):
+    if not os.path.exists(db_path):
+        print(f"\n  No database found at {db_path}")
+        print("  Run a benchmark first to collect statistics.\n")
+        return
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        _print_stats_inner(conn, model=model, suite=suite)
+    finally:
+        conn.close()
+
+
+def _print_stats_inner(conn, model=None, suite=None):
+    # Build WHERE fragments
+    run_conds, run_params = [], []
+    if model:
+        run_conds.append("r.model = ?")
+        run_params.append(model)
+    run_where = ("WHERE " + " AND ".join(run_conds)) if run_conds else ""
+
+    qr_conds = list(run_conds)  # same model filter via JOIN
+    qr_params = list(run_params)
+    if suite:
+        qr_conds.append("qr.suite = ?")
+        qr_params.append(suite)
+    qr_where = ("WHERE " + " AND ".join(qr_conds)) if qr_conds else ""
+
+    # ── 1. Per (model, temperature, suite) aggregate ──────────────────────────
+    rows = conn.execute(f"""
+        SELECT r.model, r.temperature, qr.suite,
+               COUNT(*)        AS total,
+               SUM(qr.correct) AS correct,
+               COUNT(DISTINCT r.id) AS runs
+        FROM question_results qr
+        JOIN runs r ON r.id = qr.run_id
+        {qr_where}
+        GROUP BY r.model, r.temperature, qr.suite
+        ORDER BY r.model, qr.suite, r.temperature
+    """, qr_params).fetchall()
+
+    if not rows:
+        print("\n  No statistics found in the database.\n")
+        return
+
+    # Organise: by_model[model][suite][temp] = {total, correct, runs}
+    by_model = {}
+    for row in rows:
+        m, t, s = row["model"], row["temperature"], row["suite"]
+        by_model.setdefault(m, {}).setdefault(s, {})[t] = {
+            "total":   row["total"],
+            "correct": row["correct"],
+            "runs":    row["runs"],
+        }
+
+    W = 72
+    print(f"\n{'='*W}")
+    print("  TEMPERATURE STATISTICS")
+    if model:
+        print(f"  Model  : {model}")
+    if suite:
+        print(f"  Suite  : {suite}")
+    print(f"{'='*W}\n")
+
+    for m, suites in sorted(by_model.items()):
+        if len(by_model) > 1:
+            print(f"  Model: {m}\n")
+
+        # per-suite table
+        for s, temps in sorted(suites.items()):
+            print(f"  Suite: {s}")
+            print(f"  {'Temp':>6} | {'Runs':>5} | {'Questions':>10} | {'Correct':>8} | {'Accuracy':>9}")
+            print(f"  {'─'*6}-+-{'─'*5}-+-{'─'*10}-+-{'─'*8}-+-{'─'*9}")
+            best_t, best_acc = None, -1.0
+            for t in sorted(temps):
+                d = temps[t]
+                acc = d["correct"] / d["total"] * 100 if d["total"] else 0.0
+                marker = " ◄" if acc > best_acc else ""
+                print(f"  {t:>6.2f} | {d['runs']:>5} | {d['total']:>10} | {d['correct']:>8} | {acc:>8.1f}%{marker}")
+                if acc > best_acc:
+                    best_acc, best_t = acc, t
+            print(f"\n  Best temperature for {s}: {best_t} ({best_acc:.1f}%)\n")
+
+        # overall across all suites for this model
+        if len(suites) > 1:
+            temp_agg: dict = {}
+            for s, temps in suites.items():
+                for t, d in temps.items():
+                    agg = temp_agg.setdefault(t, {"total": 0, "correct": 0})
+                    agg["total"]   += d["total"]
+                    agg["correct"] += d["correct"]
+
+            print(f"  Overall across all suites:")
+            print(f"  {'Temp':>6} | {'Questions':>10} | {'Correct':>8} | {'Accuracy':>9}")
+            print(f"  {'─'*6}-+-{'─'*10}-+-{'─'*8}-+-{'─'*9}")
+            best_t, best_acc = None, -1.0
+            for t in sorted(temp_agg):
+                d = temp_agg[t]
+                acc = d["correct"] / d["total"] * 100 if d["total"] else 0.0
+                marker = " ◄" if acc > best_acc else ""
+                print(f"  {t:>6.2f} | {d['total']:>10} | {d['correct']:>8} | {acc:>8.1f}%{marker}")
+                if acc > best_acc:
+                    best_acc, best_t = acc, t
+            print(f"\n  Best overall temperature for {m}: {best_t} ({best_acc:.1f}%)\n")
+
+    # ── 2. Per-question sensitivity (questions where temperature matters most) ─
+    sens_rows = conn.execute(f"""
+        SELECT qr.question_id, qr.suite,
+               r.temperature,
+               AVG(qr.correct) AS pass_rate
+        FROM question_results qr
+        JOIN runs r ON r.id = qr.run_id
+        {qr_where}
+        GROUP BY qr.question_id, qr.suite, r.temperature
+        HAVING COUNT(*) >= 1
+        ORDER BY qr.question_id, r.temperature
+    """, qr_params).fetchall()
+
+    # Build: per_q[question_id] = {temp: pass_rate}
+    per_q: dict = {}
+    for row in sens_rows:
+        per_q.setdefault(row["question_id"], {"suite": row["suite"], "temps": {}})\
+             ["temps"][row["temperature"]] = row["pass_rate"]
+
+    # Only show questions with ≥2 temperatures and meaningful variance
+    multi = {
+        qid: info for qid, info in per_q.items()
+        if len(info["temps"]) >= 2
+    }
+    if multi:
+        # rank by variance across temperatures
+        def _var(temps_dict):
+            vals = list(temps_dict.values())
+            mean = sum(vals) / len(vals)
+            return sum((v - mean) ** 2 for v in vals) / len(vals)
+
+        ranked = sorted(multi.items(), key=lambda kv: _var(kv[1]["temps"]), reverse=True)
+        top = ranked[:15]
+
+        all_temps = sorted({t for _, info in top for t in info["temps"]})
+        col_w = max(8, *(len(f"{t:.2f}") + 2 for t in all_temps))
+        header_temps = "  ".join(f"{t:>{col_w}.2f}" for t in all_temps)
+
+        print(f"  Questions most sensitive to temperature (top {len(top)}):\n")
+        print(f"  {'Question ID':<40}  {header_temps}")
+        print(f"  {'─'*40}  {'  '.join('─'*col_w for _ in all_temps)}")
+        for qid, info in top:
+            cells = []
+            for t in all_temps:
+                pr = info["temps"].get(t)
+                cells.append(f"{pr*100:>{col_w}.0f}%" if pr is not None else f"{'—':>{col_w}}")
+            print(f"  {qid:<40}  {'  '.join(cells)}")
+        print()
+
+    print(f"{'='*W}\n")
+
+
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
-    p = argparse.ArgumentParser(description="LLM Benchmark Runner")
-    p.add_argument("--model", required=True)
+    p = argparse.ArgumentParser(
+        description="LLM Benchmark Runner",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python bench.py --model llama3\n"
+            "  python bench.py --model llama3 --temperature 0.0\n"
+            "  python bench.py --model llama3 --temperature 0.5 --suites mmlu_cs\n"
+            "  python bench.py --stats\n"
+            "  python bench.py --stats --model llama3 --suite-filter mmlu_cs\n"
+        ),
+    )
+    # --model is optional here; validated manually below (not needed for --stats / --list-suites)
+    p.add_argument("--model", default=None)
     p.add_argument("--base-url", default=DEFAULT_BASE_URL)
     p.add_argument("--suites", nargs="+", default=DEFAULT_SUITES,
                    choices=list(SUITE_REGISTRY.keys()))
@@ -469,6 +709,14 @@ def main():
                    help="RNG seed for deterministic sampling")
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
                    help="Per-request HTTP timeout in seconds")
+    p.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE,
+                   help=f"Sampling temperature (default: {DEFAULT_TEMPERATURE})")
+    p.add_argument("--db", type=str, default=DEFAULT_DB,
+                   help=f"SQLite database for statistics (default: {DEFAULT_DB})")
+    p.add_argument("--stats", action="store_true",
+                   help="Show temperature statistics from the database and exit")
+    p.add_argument("--suite-filter", type=str, default=None,
+                   help="Filter --stats output by suite name")
 
     args = p.parse_args()
 
@@ -478,6 +726,13 @@ def main():
             print(f"  {name:<28} {info['desc']}")
         print()
         return
+
+    if args.stats:
+        print_stats(args.db, model=args.model, suite=args.suite_filter)
+        return
+
+    if not args.model:
+        p.error("--model is required when running a benchmark (omit only for --stats / --list-suites)")
 
     print("\n⏳ Loading datasets...")
     all_questions = []
@@ -504,14 +759,18 @@ def main():
     summary = run_benchmark(
         args.base_url, args.model, all_questions,
         workers=args.workers, verbose=args.verbose, seed=args.seed,
-        timeout=args.timeout,
+        timeout=args.timeout, temperature=args.temperature,
     )
     print_report(summary)
 
-    out_path = args.output or f"results_{args.model}_{int(time.time())}.json"
+    timestamp = int(time.time())
+    out_path = args.output or f"results_{args.model}_{timestamp}.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
     print(f"Results saved to {out_path}")
+
+    save_to_db(args.db, summary, timestamp)
+    print(f"Statistics saved to {args.db}")
 
 
 if __name__ == "__main__":

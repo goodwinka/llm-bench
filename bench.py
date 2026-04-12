@@ -286,10 +286,10 @@ def load_mmlu_ml(limit=None, **kw):
 MAX_ANSWER_TOKENS_BY_TASK = {
     "multiple_choice": 8,   # Single letter + possible whitespace/punctuation
 }
-MAX_ANSWER_TOKENS_DEFAULT = 264000
+MAX_ANSWER_TOKENS_DEFAULT = 512
 
 
-def query_llm(base_url, model, prompt, system="", timeout=15, max_tokens=264000, seed=-1):
+def query_llm(base_url, model, prompt, system="", timeout=60, max_tokens=512, seed=-1):
     url = f"{base_url.rstrip('/')}/chat/completions"
     messages = []
     if system:
@@ -366,7 +366,7 @@ SYSTEM_PROMPT = (
 )
 
 
-def run_benchmark(base_url, model, questions, workers=1, verbose=False, seed=-1, thinking_budget=10000):
+def run_benchmark(base_url, model, questions, workers=1, verbose=False, seed=-1, thinking_budget=0, timeout=60):
     total = len(questions)
     results = []
     correct = 0
@@ -383,7 +383,7 @@ def run_benchmark(base_url, model, questions, workers=1, verbose=False, seed=-1,
         i, q = iq
         answer_tok = MAX_ANSWER_TOKENS_BY_TASK.get(q["task"], MAX_ANSWER_TOKENS_DEFAULT)
         max_tok = thinking_budget + answer_tok
-        resp = query_llm(base_url, model, q["prompt"], SYSTEM_PROMPT, max_tokens=max_tok, seed=seed)
+        resp = query_llm(base_url, model, q["prompt"], SYSTEM_PROMPT, timeout=timeout, max_tokens=max_tok, seed=seed)
         ok = check_answer(q["expected"], resp["answer"], q["task"]) if not resp["error"] else False
         return i, q, resp, ok
 
@@ -470,6 +470,8 @@ def main():
     p.add_argument("--thinking-budget", type=int, default=0,
                    help="Extra tokens reserved for model reasoning/thinking phase (default: 0). "
                         "Set to e.g. 512 or 1024 when the model uses extended thinking.")
+    p.add_argument("--timeout", type=int, default=60,
+                   help="Per-request HTTP timeout in seconds (default: 60)")
 
     args = p.parse_args()
 
@@ -505,6 +507,7 @@ def main():
     summary = run_benchmark(
         args.base_url, args.model, all_questions,
         workers=args.workers, verbose=args.verbose, seed=args.seed,
+        thinking_budget=args.thinking_budget, timeout=args.timeout,
     )
     print_report(summary)
 

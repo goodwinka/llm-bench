@@ -328,11 +328,11 @@ def query_llm(base_url, model, prompt, system="", timeout=DEFAULT_TIMEOUT, seed=
             last_error = e
             if e.response is None or e.response.status_code not in _RETRY_STATUS_CODES:
                 break  # non-retryable HTTP error (4xx, etc.)
-        except (requests.ConnectionError, requests.Timeout) as e:
-            last_error = e  # transient network failure — retry
+        except requests.ConnectionError as e:
+            last_error = e  # server unreachable / connect timeout — retry
         except Exception as e:
             last_error = e
-            break  # unexpected error, don't retry
+            break  # read timeout, unexpected error — don't retry
     return {"answer": "", "latency": time.perf_counter() - t0, "error": str(last_error)}
 
 

@@ -279,10 +279,10 @@ def load_mmlu_ml(limit=None, **kw):
 MAX_ANSWER_TOKENS_BY_TASK = {
     "multiple_choice": 8,   # Single letter + possible whitespace/punctuation
 }
-MAX_ANSWER_TOKENS_DEFAULT = 64
+MAX_ANSWER_TOKENS_DEFAULT = 264000
 
 
-def query_llm(base_url, model, prompt, system="", timeout=120, max_tokens=64, seed=0):
+def query_llm(base_url, model, prompt, system="", timeout=15, max_tokens=264000, seed=-1):
     url = f"{base_url.rstrip('/')}/chat/completions"
     messages = []
     if system:
@@ -295,7 +295,7 @@ def query_llm(base_url, model, prompt, system="", timeout=120, max_tokens=64, se
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": 0.0,
+            "temperature": 1.0,
             "seed": seed,  # deterministic output across runs
         }, timeout=timeout)
         resp.raise_for_status()
@@ -346,7 +346,7 @@ SYSTEM_PROMPT = (
 )
 
 
-def run_benchmark(base_url, model, questions, workers=1, verbose=False, seed=0, thinking_budget=0):
+def run_benchmark(base_url, model, questions, workers=1, verbose=False, seed=-1, thinking_budget=10000):
     total = len(questions)
     results = []
     correct = 0
@@ -445,7 +445,7 @@ def main():
     p.add_argument("--list-suites", action="store_true")
     p.add_argument("--cruxeval-x-path", type=str, default=None,
                    help="Path to cruxeval-x/data/cruxeval_preprocessed")
-    p.add_argument("--seed", type=int, default=0,
+    p.add_argument("--seed", type=int, default=-1,
                    help="RNG seed for deterministic sampling (default: 0)")
     p.add_argument("--thinking-budget", type=int, default=0,
                    help="Extra tokens reserved for model reasoning/thinking phase (default: 0). "
@@ -485,7 +485,6 @@ def main():
     summary = run_benchmark(
         args.base_url, args.model, all_questions,
         workers=args.workers, verbose=args.verbose, seed=args.seed,
-        thinking_budget=args.thinking_budget,
     )
     print_report(summary)
 

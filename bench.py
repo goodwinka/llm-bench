@@ -275,10 +275,11 @@ def load_mmlu_ml(limit=None, **kw):
 
 # ─── LLM Client ──────────────────────────────────────────────────────────────
 
-MAX_TOKENS_BY_TASK = {
-    "multiple_choice": 4,    # Only need a single letter (A/B/C/D)
+# Final-answer token budgets per task type (excluding any thinking budget).
+MAX_ANSWER_TOKENS_BY_TASK = {
+    "multiple_choice": 8,   # Single letter + possible whitespace/punctuation
 }
-MAX_TOKENS_DEFAULT = 64
+MAX_ANSWER_TOKENS_DEFAULT = 64
 
 
 def query_llm(base_url, model, prompt, system="", timeout=120, max_tokens=64, seed=0):
@@ -295,7 +296,6 @@ def query_llm(base_url, model, prompt, system="", timeout=120, max_tokens=64, se
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": 0.0,
-            "top_k": 1,   # greedy: short-circuits sampler chain (llama.cpp/Ollama)
             "seed": seed,  # deterministic output across runs
         }, timeout=timeout)
         resp.raise_for_status()
@@ -346,7 +346,7 @@ SYSTEM_PROMPT = (
 )
 
 
-def run_benchmark(base_url, model, questions, workers=1, verbose=False, seed=0):
+def run_benchmark(base_url, model, questions, workers=1, verbose=False, seed=0, thinking_budget=0):
     total = len(questions)
     results = []
     correct = 0
@@ -361,7 +361,8 @@ def run_benchmark(base_url, model, questions, workers=1, verbose=False, seed=0):
 
     def process(iq):
         i, q = iq
-        max_tok = MAX_TOKENS_BY_TASK.get(q["task"], MAX_TOKENS_DEFAULT)
+        answer_tok = MAX_ANSWER_TOKENS_BY_TASK.get(q["task"], MAX_ANSWER_TOKENS_DEFAULT)
+        max_tok = thinking_budget + answer_tok
         resp = query_llm(base_url, model, q["prompt"], SYSTEM_PROMPT, max_tokens=max_tok, seed=seed)
         ok = check_answer(q["expected"], resp["answer"], q["task"]) if not resp["error"] else False
         return i, q, resp, ok
@@ -446,6 +447,9 @@ def main():
                    help="Path to cruxeval-x/data/cruxeval_preprocessed")
     p.add_argument("--seed", type=int, default=0,
                    help="RNG seed for deterministic sampling (default: 0)")
+    p.add_argument("--thinking-budget", type=int, default=0,
+                   help="Extra tokens reserved for model reasoning/thinking phase (default: 0). "
+                        "Set to e.g. 512 or 1024 when the model uses extended thinking.")
 
     args = p.parse_args()
 
@@ -481,6 +485,7 @@ def main():
     summary = run_benchmark(
         args.base_url, args.model, all_questions,
         workers=args.workers, verbose=args.verbose, seed=args.seed,
+        thinking_budget=args.thinking_budget,
     )
     print_report(summary)
 

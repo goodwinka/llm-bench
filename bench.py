@@ -286,25 +286,27 @@ def load_mmlu_ml(limit=None, **kw):
 MAX_ANSWER_TOKENS_BY_TASK = {
     "multiple_choice": 8,   # Single letter + possible whitespace/punctuation
 }
-MAX_ANSWER_TOKENS_DEFAULT = 16384
 
 
-def query_llm(base_url, model, prompt, system="", timeout=15, max_tokens=16384, seed=-1):
+def query_llm(base_url, model, prompt, system="", timeout=15, max_tokens=None, seed=-1):
     url = f"{base_url.rstrip('/')}/chat/completions"
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
+    body = {
+        "model": model,
+        "messages": messages,
+        "temperature": 1.0,
+        "seed": seed,  # deterministic output across runs
+    }
+    if max_tokens is not None:
+        body["max_tokens"] = max_tokens
+
     t0 = time.perf_counter()
     try:
-        resp = requests.post(url, json={
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": 1.0,
-            "seed": seed,  # deterministic output across runs
-        }, timeout=timeout)
+        resp = requests.post(url, json=body, timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
         latency = time.perf_counter() - t0
@@ -381,8 +383,8 @@ def run_benchmark(base_url, model, questions, workers=1, verbose=False, seed=-1,
 
     def process(iq):
         i, q = iq
-        answer_tok = MAX_ANSWER_TOKENS_BY_TASK.get(q["task"], MAX_ANSWER_TOKENS_DEFAULT)
-        max_tok = thinking_budget + answer_tok
+        answer_tok = MAX_ANSWER_TOKENS_BY_TASK.get(q["task"])
+        max_tok = (thinking_budget + answer_tok) if answer_tok is not None else (thinking_budget or None)
         resp = query_llm(base_url, model, q["prompt"], SYSTEM_PROMPT, timeout=timeout, max_tokens=max_tok, seed=seed)
         ok = check_answer(q["expected"], resp["answer"], q["task"]) if not resp["error"] else False
         return i, q, resp, ok

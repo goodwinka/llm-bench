@@ -265,7 +265,7 @@ def _load_mmlu_subject(subject, suite_name, limit=None, **kw):
 
 @register_suite("mmlu_cs", "MMLU Computer Science — multiple choice (cais/mmlu)")
 def load_mmlu_cs(limit=None, **kw):
-    return _load_mmlu_subject("computer_science", "mmlu_cs", limit)
+    return _load_mmlu_subject("college_computer_science", "mmlu_cs", limit)
 
 
 @register_suite("mmlu_machine_learning", "MMLU Machine Learning — multiple choice (cais/mmlu)")

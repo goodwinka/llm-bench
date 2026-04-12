@@ -50,12 +50,11 @@ except ImportError:
 
 # ─── Defaults ────────────────────────────────────────────────────────────────
 
-DEFAULT_BASE_URL     = "http://localhost:11434/v1"
-DEFAULT_WORKERS      = 1
-DEFAULT_TIMEOUT      = 15
-DEFAULT_SEED         = -1
-DEFAULT_THINKING_BUDGET = 0
-DEFAULT_SUITES       = ["cruxeval", "mmlu_cs"]
+DEFAULT_BASE_URL = "http://localhost:11434/v1"
+DEFAULT_WORKERS  = 1
+DEFAULT_TIMEOUT  = 15
+DEFAULT_SEED     = -1
+DEFAULT_SUITES   = ["cruxeval", "mmlu_cs"]
 
 
 # ─── Suite Registry ──────────────────────────────────────────────────────────
@@ -372,7 +371,7 @@ SYSTEM_PROMPT = (
 )
 
 
-def run_benchmark(base_url, model, questions, workers=DEFAULT_WORKERS, verbose=False, seed=DEFAULT_SEED, thinking_budget=DEFAULT_THINKING_BUDGET, timeout=DEFAULT_TIMEOUT):
+def run_benchmark(base_url, model, questions, workers=DEFAULT_WORKERS, verbose=False, seed=DEFAULT_SEED, timeout=DEFAULT_TIMEOUT):
     total = len(questions)
     results = []
     correct = 0
@@ -387,8 +386,7 @@ def run_benchmark(base_url, model, questions, workers=DEFAULT_WORKERS, verbose=F
 
     def process(iq):
         i, q = iq
-        max_tok = thinking_budget or None
-        resp = query_llm(base_url, model, q["prompt"], SYSTEM_PROMPT, timeout=timeout, max_tokens=max_tok, seed=seed)
+        resp = query_llm(base_url, model, q["prompt"], SYSTEM_PROMPT, timeout=timeout, seed=seed)
         ok = check_answer(q["expected"], resp["answer"], q["task"]) if not resp["error"] else False
         return i, q, resp, ok
 
@@ -472,9 +470,6 @@ def main():
                    help="Path to cruxeval-x/data/cruxeval_preprocessed")
     p.add_argument("--seed", type=int, default=DEFAULT_SEED,
                    help="RNG seed for deterministic sampling")
-    p.add_argument("--thinking-budget", type=int, default=DEFAULT_THINKING_BUDGET,
-                   help="Extra tokens reserved for model reasoning/thinking phase. "
-                        "Set to e.g. 512 or 1024 when the model uses extended thinking.")
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
                    help="Per-request HTTP timeout in seconds")
 
@@ -512,7 +507,7 @@ def main():
     summary = run_benchmark(
         args.base_url, args.model, all_questions,
         workers=args.workers, verbose=args.verbose, seed=args.seed,
-        thinking_budget=args.thinking_budget, timeout=args.timeout,
+        timeout=args.timeout,
     )
     print_report(summary)
 

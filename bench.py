@@ -50,7 +50,7 @@ except ImportError:
 
 # ─── Defaults ────────────────────────────────────────────────────────────────
 
-DEFAULT_BASE_URL   = "http://localhost:11434/v1"
+DEFAULT_BASE_URL   = "http://localhost:11435/v1"
 DEFAULT_WORKERS    = 1
 DEFAULT_TIMEOUT    = 15
 DEFAULT_SEED       = -1

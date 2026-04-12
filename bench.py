@@ -48,6 +48,16 @@ except ImportError:
     sys.exit("pip install datasets")
 
 
+# ─── Defaults ────────────────────────────────────────────────────────────────
+
+DEFAULT_BASE_URL     = "http://localhost:11434/v1"
+DEFAULT_WORKERS      = 1
+DEFAULT_TIMEOUT      = 15
+DEFAULT_SEED         = -1
+DEFAULT_THINKING_BUDGET = 0
+DEFAULT_SUITES       = ["cruxeval", "mmlu_cs"]
+
+
 # ─── Suite Registry ──────────────────────────────────────────────────────────
 
 SUITE_REGISTRY = {}
@@ -282,8 +292,7 @@ def load_mmlu_ml(limit=None, **kw):
 
 # ─── LLM Client ──────────────────────────────────────────────────────────────
 
-# Final-answer token budgets per task type (excluding any thinking budget).
-def query_llm(base_url, model, prompt, system="", timeout=15, max_tokens=None, seed=-1):
+def query_llm(base_url, model, prompt, system="", timeout=DEFAULT_TIMEOUT, max_tokens=None, seed=DEFAULT_SEED):
     url = f"{base_url.rstrip('/')}/chat/completions"
     messages = []
     if system:
@@ -363,7 +372,7 @@ SYSTEM_PROMPT = (
 )
 
 
-def run_benchmark(base_url, model, questions, workers=1, verbose=False, seed=-1, thinking_budget=0, timeout=15):
+def run_benchmark(base_url, model, questions, workers=DEFAULT_WORKERS, verbose=False, seed=DEFAULT_SEED, thinking_budget=DEFAULT_THINKING_BUDGET, timeout=DEFAULT_TIMEOUT):
     total = len(questions)
     results = []
     correct = 0
@@ -451,23 +460,23 @@ def print_report(s):
 def main():
     p = argparse.ArgumentParser(description="LLM Benchmark Runner")
     p.add_argument("--model", required=True)
-    p.add_argument("--base-url", default="http://localhost:11434/v1")
-    p.add_argument("--suites", nargs="+", default=["cruxeval", "mmlu_cs"],
+    p.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    p.add_argument("--suites", nargs="+", default=DEFAULT_SUITES,
                    choices=list(SUITE_REGISTRY.keys()))
     p.add_argument("--limit", type=int, default=None, help="Max questions per suite")
-    p.add_argument("--workers", type=int, default=1)
+    p.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--output", type=str, default=None)
     p.add_argument("--list-suites", action="store_true")
     p.add_argument("--cruxeval-x-path", type=str, default=None,
                    help="Path to cruxeval-x/data/cruxeval_preprocessed")
-    p.add_argument("--seed", type=int, default=-1,
-                   help="RNG seed for deterministic sampling (default: 0)")
-    p.add_argument("--thinking-budget", type=int, default=0,
-                   help="Extra tokens reserved for model reasoning/thinking phase (default: 0). "
+    p.add_argument("--seed", type=int, default=DEFAULT_SEED,
+                   help="RNG seed for deterministic sampling")
+    p.add_argument("--thinking-budget", type=int, default=DEFAULT_THINKING_BUDGET,
+                   help="Extra tokens reserved for model reasoning/thinking phase. "
                         "Set to e.g. 512 or 1024 when the model uses extended thinking.")
-    p.add_argument("--timeout", type=int, default=15,
-                   help="Per-request HTTP timeout in seconds (default: 15)")
+    p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
+                   help="Per-request HTTP timeout in seconds")
 
     args = p.parse_args()
 

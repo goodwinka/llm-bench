@@ -390,7 +390,7 @@ SYSTEM_PROMPT = (
 
 def run_benchmark(base_url, model, questions, workers=DEFAULT_WORKERS, verbose=False, seed=DEFAULT_SEED,
                   timeout=DEFAULT_TIMEOUT, temperature=DEFAULT_TEMPERATURE,
-                  max_retries=DEFAULT_MAX_RETRIES):
+                  max_retries=DEFAULT_MAX_RETRIES, db_conn=None, run_id=None):
     total = len(questions)
     results = []
     correct = 0
@@ -430,11 +430,15 @@ def run_benchmark(base_url, model, questions, workers=DEFAULT_WORKERS, verbose=F
         if verbose and not ok and not resp["error"]:
             print(f"\n    exp={q['expected']!r}  got={resp['answer']!r}")
 
-        results.append({
+        result = {
             "id": q["id"], "suite": q["suite"], "task": q["task"],
             "expected": q["expected"], "answer": resp["answer"],
             "correct": ok, "latency": resp["latency"], "error": resp["error"],
-        })
+        }
+        results.append(result)
+
+        if db_conn is not None and run_id is not None:
+            save_question(db_conn, run_id, result)
 
     items = list(enumerate(questions))
     if workers > 1:
@@ -477,7 +481,7 @@ def print_report(s):
 # ─── Database ────────────────────────────────────────────────────────────────
 
 def init_db(db_path):
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS runs (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -499,45 +503,64 @@ def init_db(db_path):
             suite       TEXT    NOT NULL,
             task        TEXT    NOT NULL,
             correct     INTEGER NOT NULL,
-            latency     REAL
+            latency     REAL,
+            expected    TEXT,
+            answer      TEXT,
+            error       TEXT
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_qr_question ON question_results(question_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_qr_suite    ON question_results(suite)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_model  ON runs(model, temperature)")
     conn.commit()
+    # Migrate: add columns that may be missing in older DBs
+    for col, typ in [("expected", "TEXT"), ("answer", "TEXT"), ("error", "TEXT")]:
+        try:
+            conn.execute(f"ALTER TABLE question_results ADD COLUMN {col} {typ}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
     return conn
 
 
-def save_to_db(db_path, summary, timestamp):
+def create_run(db_path, model, temperature, seed, suites, timestamp):
+    """Open DB, insert a run record, return (conn, run_id)."""
     conn = init_db(db_path)
-    try:
-        cur = conn.cursor()
-        suites_json = json.dumps(sorted(summary["by_suite"].keys()))
-        cur.execute(
-            "INSERT INTO runs (model, temperature, seed, timestamp, suites, total, correct, accuracy) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (summary["model"], summary["temperature"], summary["seed"],
-             timestamp, suites_json,
-             summary["total"], summary["correct"], summary["accuracy"]),
-        )
-        run_id = cur.lastrowid
-        cur.executemany(
-            "INSERT INTO question_results (run_id, question_id, suite, task, correct, latency) "
-            "VALUES (?,?,?,?,?,?)",
-            [
-                (run_id, r["id"], r["suite"], r["task"], int(r["correct"]), r["latency"])
-                for r in summary["results"]
-            ],
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO runs (model, temperature, seed, timestamp, suites) VALUES (?,?,?,?,?)",
+        (model, temperature, seed, timestamp, json.dumps(sorted(suites)))
+    )
+    conn.commit()
+    return conn, cur.lastrowid
+
+
+def save_question(conn, run_id, result):
+    """Write one question result to DB immediately and commit."""
+    conn.execute(
+        "INSERT INTO question_results "
+        "(run_id, question_id, suite, task, correct, latency, expected, answer, error) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (run_id, result["id"], result["suite"], result["task"],
+         int(result["correct"]), result["latency"],
+         result["expected"], result["answer"], result.get("error") or "")
+    )
+    conn.commit()
+
+
+def finish_run(conn, run_id, total, correct, accuracy):
+    """Write final run totals and close the connection."""
+    conn.execute(
+        "UPDATE runs SET total=?, correct=?, accuracy=? WHERE id=?",
+        (total, correct, accuracy, run_id)
+    )
+    conn.commit()
+    conn.close()
 
 
 # ─── Statistics ───────────────────────────────────────────────────────────────
 
-def print_stats(db_path, model=None, suite=None):
+def print_stats(db_path, model=None, suite=None, per_question=False):
     if not os.path.exists(db_path):
         print(f"\n  No database found at {db_path}")
         print("  Run a benchmark first to collect statistics.\n")
@@ -546,12 +569,12 @@ def print_stats(db_path, model=None, suite=None):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
-        _print_stats_inner(conn, model=model, suite=suite)
+        _print_stats_inner(conn, model=model, suite=suite, per_question=per_question)
     finally:
         conn.close()
 
 
-def _print_stats_inner(conn, model=None, suite=None):
+def _print_stats_inner(conn, model=None, suite=None, per_question=False):
     # Build WHERE fragments
     run_conds, run_params = [], []
     if model:
@@ -692,6 +715,52 @@ def _print_stats_inner(conn, model=None, suite=None):
             print(f"  {qid:<40}  {'  '.join(cells)}")
         print()
 
+    # ── 3. Per-question pass rates ─────────────────────────────────────────────
+    pq_rows = conn.execute(f"""
+        SELECT qr.question_id, qr.suite,
+               COUNT(*)         AS attempts,
+               SUM(qr.correct)  AS correct,
+               AVG(qr.correct)  AS pass_rate
+        FROM question_results qr
+        JOIN runs r ON r.id = qr.run_id
+        {qr_where}
+        GROUP BY qr.question_id, qr.suite
+        ORDER BY AVG(qr.correct) ASC, qr.question_id
+    """, qr_params).fetchall()
+
+    if pq_rows:
+        n = len(pq_rows)
+        never   = sum(1 for r in pq_rows if r["pass_rate"] == 0.0)
+        always  = sum(1 for r in pq_rows if r["pass_rate"] == 1.0)
+        partial = n - never - always
+
+        print(f"  Per-question summary ({n} unique questions):\n")
+        print(f"    Always correct : {always:>5}  ({always/n*100:.1f}%)")
+        print(f"    Variable       : {partial:>5}  ({partial/n*100:.1f}%)")
+        print(f"    Always wrong   : {never:>5}  ({never/n*100:.1f}%)\n")
+
+        if per_question:
+            print(f"  {'Question ID':<44}  {'Suite':<22}  {'Att':>4}  {'OK':>4}  {'Pass%':>6}")
+            print(f"  {'─'*44}  {'─'*22}  {'─'*4}  {'─'*4}  {'─'*6}")
+            for r in pq_rows:
+                acc = r["pass_rate"] * 100
+                print(f"  {r['question_id']:<44}  {r['suite']:<22}  {r['attempts']:>4}  {r['correct']:>4}  {acc:>5.0f}%")
+            print()
+        else:
+            # Always show worst questions (those with pass_rate < 100%)
+            failures = [r for r in pq_rows if r["pass_rate"] < 1.0]
+            if failures:
+                show = failures[:20]
+                print(f"  Worst-performing questions (pass% < 100, showing {len(show)} of {len(failures)}):\n")
+                print(f"  {'Question ID':<44}  {'Suite':<22}  {'Att':>4}  {'OK':>4}  {'Pass%':>6}")
+                print(f"  {'─'*44}  {'─'*22}  {'─'*4}  {'─'*4}  {'─'*6}")
+                for r in show:
+                    acc = r["pass_rate"] * 100
+                    print(f"  {r['question_id']:<44}  {r['suite']:<22}  {r['attempts']:>4}  {r['correct']:>4}  {acc:>5.0f}%")
+                print()
+                if len(failures) > 20:
+                    print(f"  (use --per-question to see all {len(failures)} failing questions)\n")
+
     print(f"{'='*W}\n")
 
 
@@ -736,6 +805,8 @@ def main():
                    help="Show temperature statistics from the database and exit")
     p.add_argument("--suite-filter", type=str, default=None,
                    help="Filter --stats output by suite name")
+    p.add_argument("--per-question", action="store_true",
+                   help="With --stats: show full per-question pass-rate table")
 
     args = p.parse_args()
 
@@ -747,7 +818,8 @@ def main():
         return
 
     if args.stats:
-        print_stats(args.db, model=args.model, suite=args.suite_filter)
+        print_stats(args.db, model=args.model, suite=args.suite_filter,
+                    per_question=args.per_question)
         return
 
     if not args.model:
@@ -775,22 +847,28 @@ def main():
         print(f"  ✗ Cannot reach API: {e}")
         return
 
+    timestamp = int(time.time())
+    db_conn, run_id = create_run(
+        args.db, args.model, args.temperature, args.seed, args.suites, timestamp
+    )
+    print(f"  Recording results live → {args.db}  (run #{run_id})")
+
     summary = run_benchmark(
         args.base_url, args.model, all_questions,
         workers=args.workers, verbose=args.verbose, seed=args.seed,
         timeout=args.timeout, temperature=args.temperature,
         max_retries=args.max_retries,
+        db_conn=db_conn, run_id=run_id,
     )
     print_report(summary)
 
-    timestamp = int(time.time())
+    finish_run(db_conn, run_id, summary["total"], summary["correct"], summary["accuracy"])
+    print(f"Statistics saved to {args.db}")
+
     out_path = args.output or f"results_{args.model}_{timestamp}.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
     print(f"Results saved to {out_path}")
-
-    save_to_db(args.db, summary, timestamp)
-    print(f"Statistics saved to {args.db}")
 
 
 if __name__ == "__main__":

@@ -275,7 +275,13 @@ def load_mmlu_ml(limit=None, **kw):
 
 # ─── LLM Client ──────────────────────────────────────────────────────────────
 
-def query_llm(base_url, model, prompt, system="", timeout=120, max_tokens=64):
+MAX_TOKENS_BY_TASK = {
+    "multiple_choice": 4,    # Only need a single letter (A/B/C/D)
+}
+MAX_TOKENS_DEFAULT = 64
+
+
+def query_llm(base_url, model, prompt, system="", timeout=120, max_tokens=64, seed=0):
     url = f"{base_url.rstrip('/')}/chat/completions"
     messages = []
     if system:
@@ -289,6 +295,8 @@ def query_llm(base_url, model, prompt, system="", timeout=120, max_tokens=64):
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": 0.0,
+            "top_k": 1,   # greedy: short-circuits sampler chain (llama.cpp/Ollama)
+            "seed": seed,  # deterministic output across runs
         }, timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
@@ -338,7 +346,7 @@ SYSTEM_PROMPT = (
 )
 
 
-def run_benchmark(base_url, model, questions, workers=1, verbose=False):
+def run_benchmark(base_url, model, questions, workers=1, verbose=False, seed=0):
     total = len(questions)
     results = []
     correct = 0
@@ -353,7 +361,8 @@ def run_benchmark(base_url, model, questions, workers=1, verbose=False):
 
     def process(iq):
         i, q = iq
-        resp = query_llm(base_url, model, q["prompt"], SYSTEM_PROMPT)
+        max_tok = MAX_TOKENS_BY_TASK.get(q["task"], MAX_TOKENS_DEFAULT)
+        resp = query_llm(base_url, model, q["prompt"], SYSTEM_PROMPT, max_tokens=max_tok, seed=seed)
         ok = check_answer(q["expected"], resp["answer"], q["task"]) if not resp["error"] else False
         return i, q, resp, ok
 
@@ -435,6 +444,8 @@ def main():
     p.add_argument("--list-suites", action="store_true")
     p.add_argument("--cruxeval-x-path", type=str, default=None,
                    help="Path to cruxeval-x/data/cruxeval_preprocessed")
+    p.add_argument("--seed", type=int, default=0,
+                   help="RNG seed for deterministic sampling (default: 0)")
 
     args = p.parse_args()
 
@@ -469,7 +480,7 @@ def main():
 
     summary = run_benchmark(
         args.base_url, args.model, all_questions,
-        workers=args.workers, verbose=args.verbose,
+        workers=args.workers, verbose=args.verbose, seed=args.seed,
     )
     print_report(summary)
 

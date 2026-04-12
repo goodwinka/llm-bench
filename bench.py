@@ -53,10 +53,14 @@ except ImportError:
 DEFAULT_BASE_URL   = "http://localhost:11435/v1"
 DEFAULT_WORKERS    = 1
 DEFAULT_TIMEOUT    = 15
+DEFAULT_MAX_RETRIES = 3
 DEFAULT_SEED       = -1
 DEFAULT_SUITES     = ["cruxeval", "mmlu_cs"]
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_DB         = "bench_stats.db"
+
+# HTTP status codes that warrant a retry (transient server errors)
+_RETRY_STATUS_CODES = {502, 503, 504}
 
 
 # ─── Suite Registry ──────────────────────────────────────────────────────────
@@ -294,7 +298,7 @@ def load_mmlu_ml(limit=None, **kw):
 # ─── LLM Client ──────────────────────────────────────────────────────────────
 
 def query_llm(base_url, model, prompt, system="", timeout=DEFAULT_TIMEOUT, seed=DEFAULT_SEED,
-              temperature=DEFAULT_TEMPERATURE):
+              temperature=DEFAULT_TEMPERATURE, max_retries=DEFAULT_MAX_RETRIES):
     url = f"{base_url.rstrip('/')}/chat/completions"
     messages = []
     if system:
@@ -309,15 +313,27 @@ def query_llm(base_url, model, prompt, system="", timeout=DEFAULT_TIMEOUT, seed=
     }
 
     t0 = time.perf_counter()
-    try:
-        resp = requests.post(url, json=body, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        latency = time.perf_counter() - t0
-        answer = data["choices"][0]["message"]["content"].strip()
-        return {"answer": answer, "latency": latency, "error": None}
-    except Exception as e:
-        return {"answer": "", "latency": time.perf_counter() - t0, "error": str(e)}
+    last_error = None
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            time.sleep(2 ** (attempt - 1))  # 1s, 2s, 4s, …
+        try:
+            resp = requests.post(url, json=body, timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            latency = time.perf_counter() - t0
+            answer = data["choices"][0]["message"]["content"].strip()
+            return {"answer": answer, "latency": latency, "error": None}
+        except requests.HTTPError as e:
+            last_error = e
+            if e.response is None or e.response.status_code not in _RETRY_STATUS_CODES:
+                break  # non-retryable HTTP error (4xx, etc.)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            last_error = e  # transient network failure — retry
+        except Exception as e:
+            last_error = e
+            break  # unexpected error, don't retry
+    return {"answer": "", "latency": time.perf_counter() - t0, "error": str(last_error)}
 
 
 # ─── Answer Evaluation ───────────────────────────────────────────────────────
@@ -373,7 +389,8 @@ SYSTEM_PROMPT = (
 
 
 def run_benchmark(base_url, model, questions, workers=DEFAULT_WORKERS, verbose=False, seed=DEFAULT_SEED,
-                  timeout=DEFAULT_TIMEOUT, temperature=DEFAULT_TEMPERATURE):
+                  timeout=DEFAULT_TIMEOUT, temperature=DEFAULT_TEMPERATURE,
+                  max_retries=DEFAULT_MAX_RETRIES):
     total = len(questions)
     results = []
     correct = 0
@@ -389,7 +406,7 @@ def run_benchmark(base_url, model, questions, workers=DEFAULT_WORKERS, verbose=F
     def process(iq):
         i, q = iq
         resp = query_llm(base_url, model, q["prompt"], SYSTEM_PROMPT, timeout=timeout, seed=seed,
-                         temperature=temperature)
+                         temperature=temperature, max_retries=max_retries)
         ok = check_answer(q["expected"], resp["answer"], q["task"]) if not resp["error"] else False
         return i, q, resp, ok
 
@@ -709,6 +726,8 @@ def main():
                    help="RNG seed for deterministic sampling")
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
                    help="Per-request HTTP timeout in seconds")
+    p.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES,
+                   help=f"Max retries for transient server errors 502/503/504 (default: {DEFAULT_MAX_RETRIES})")
     p.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE,
                    help=f"Sampling temperature (default: {DEFAULT_TEMPERATURE})")
     p.add_argument("--db", type=str, default=DEFAULT_DB,
@@ -760,6 +779,7 @@ def main():
         args.base_url, args.model, all_questions,
         workers=args.workers, verbose=args.verbose, seed=args.seed,
         timeout=args.timeout, temperature=args.temperature,
+        max_retries=args.max_retries,
     )
     print_report(summary)
 

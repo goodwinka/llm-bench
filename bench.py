@@ -283,11 +283,6 @@ def load_mmlu_ml(limit=None, **kw):
 # ─── LLM Client ──────────────────────────────────────────────────────────────
 
 # Final-answer token budgets per task type (excluding any thinking budget).
-MAX_ANSWER_TOKENS_BY_TASK = {
-    "multiple_choice": 8,   # Single letter + possible whitespace/punctuation
-}
-
-
 def query_llm(base_url, model, prompt, system="", timeout=15, max_tokens=None, seed=-1):
     url = f"{base_url.rstrip('/')}/chat/completions"
     messages = []
@@ -383,8 +378,7 @@ def run_benchmark(base_url, model, questions, workers=1, verbose=False, seed=-1,
 
     def process(iq):
         i, q = iq
-        answer_tok = MAX_ANSWER_TOKENS_BY_TASK.get(q["task"])
-        max_tok = (thinking_budget + answer_tok) if answer_tok is not None else (thinking_budget or None)
+        max_tok = thinking_budget or None
         resp = query_llm(base_url, model, q["prompt"], SYSTEM_PROMPT, timeout=timeout, max_tokens=max_tok, seed=seed)
         ok = check_answer(q["expected"], resp["answer"], q["task"]) if not resp["error"] else False
         return i, q, resp, ok

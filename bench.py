@@ -163,9 +163,14 @@ def _load_cruxeval_x_lang(lang, lang_label, limit=None, cruxeval_x_path=None, **
         print(f"     Then re-run with: --cruxeval-x-path ./cruxeval-x/data/cruxeval_preprocessed\n")
         return []
 
-    # Find jsonl files for this language
+    # Find jsonl files for this language.
+    # Use word-boundary matching so "c" doesn't match "cpp" filenames.
     all_files = glob.glob(os.path.join(base, "**", "*.jsonl"), recursive=True)
-    files = [f for f in all_files if lang in os.path.basename(f).lower()]
+    files = [
+        f for f in all_files
+        if re.search(r'(?<![a-z])' + re.escape(lang) + r'(?![a-z+])',
+                     os.path.basename(f).lower())
+    ]
     if not files:
         print(f"\n  ⚠  No JSONL for '{lang}' in {base}")
         print(f"     Found: {[os.path.basename(f) for f in all_files[:15]]}")
@@ -193,10 +198,11 @@ def _load_cruxeval_x_lang(lang, lang_label, limit=None, cruxeval_x_path=None, **
                             "suite": f"cruxeval_x_{lang}",
                             "task": "output_prediction",
                             "prompt": (
-                                f"Look at this {lang_label} code.\n"
-                                f"What value should replace '????' to make the check pass?\n\n"
+                                f"What value should replace '????' in this {lang_label} code "
+                                f"to make the assertion pass?\n\n"
                                 f"{out_check}\n\n"
-                                f"Reply with ONLY the exact value. No explanation."
+                                f"Full code for reference:\n{code}\n\n"
+                                f"Reply with ONLY the exact replacement value. No explanation."
                             ),
                             "expected": expected,
                         })
@@ -212,10 +218,11 @@ def _load_cruxeval_x_lang(lang, lang_label, limit=None, cruxeval_x_path=None, **
                             "suite": f"cruxeval_x_{lang}",
                             "task": "input_prediction",
                             "prompt": (
-                                f"Look at this {lang_label} code.\n"
-                                f"What value should replace '????' to make the check pass?\n\n"
+                                f"What value should replace '????' in this {lang_label} code "
+                                f"to make the assertion pass?\n\n"
                                 f"{inp_check}\n\n"
-                                f"Reply with ONLY the exact value. No explanation."
+                                f"Full code for reference:\n{code}\n\n"
+                                f"Reply with ONLY the exact replacement value. No explanation."
                             ),
                             "expected": expected,
                         })
@@ -335,7 +342,20 @@ def check_answer(expected, actual_raw, task):
 
     def strip_all(s):
         return re.sub(r"[\s'\"()]", "", s)
-    return strip_all(exp) == strip_all(act)
+    if strip_all(exp) == strip_all(act):
+        return True
+
+    # For C++ expected values with verbose type annotations (std:: prefix),
+    # fall back to comparing the sequence of numeric literals in order.
+    # This lets a model answer "[(4, 1), (4, 1), (2, 3)]" match
+    # "(std::vector<...>({std::make_tuple(4, 1), std::make_tuple(2, 3)}))"
+    if "std::" in exp:
+        exp_nums = re.findall(r"-?\d+", exp)
+        act_nums = re.findall(r"-?\d+", act)
+        if exp_nums and act_nums and exp_nums == act_nums:
+            return True
+
+    return False
 
 
 # ─── Runner ──────────────────────────────────────────────────────────────────

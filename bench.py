@@ -28,6 +28,7 @@ Suites:
 
 import argparse
 import json
+import random
 import sqlite3
 import sys
 import time
@@ -61,6 +62,11 @@ DEFAULT_DB         = "bench_stats.db"
 
 # HTTP status codes that warrant a retry (transient server errors)
 _RETRY_STATUS_CODES = {502, 503, 504}
+
+
+def seed_label(seed):
+    """Return a human-readable label for the seed value."""
+    return "random (no fixed seed)" if seed < 0 else f"fixed: {seed}"
 
 
 # ─── Suite Registry ──────────────────────────────────────────────────────────
@@ -399,8 +405,9 @@ def run_benchmark(base_url, model, questions, workers=DEFAULT_WORKERS, verbose=F
     stats = defaultdict(lambda: {"total": 0, "correct": 0, "latency": 0.0})
 
     print(f"\n{'='*65}")
-    print(f"  Model: {model}")
+    print(f"  Model:     {model}")
     print(f"  Questions: {total}  |  Workers: {workers}")
+    print(f"  Seed:      {seed_label(seed)}")
     print(f"{'='*65}\n")
 
     def process(iq):
@@ -462,7 +469,8 @@ def run_benchmark(base_url, model, questions, workers=DEFAULT_WORKERS, verbose=F
 
 def print_report(s):
     print(f"\n\n{'='*65}")
-    print(f"  RESULTS — {s['model']}  (temperature={s.get('temperature', '?')})")
+    print(f"  RESULTS — {s['model']}")
+    print(f"  temperature={s.get('temperature', '?')}  seed: {seed_label(s.get('seed', -1))}")
     print(f"{'='*65}")
     print(f"  Total:  {s['correct']}/{s['total']}  ({s['accuracy']*100:.1f}%)  "
           f"avg {s['avg_latency']:.2f}s/question")
@@ -764,6 +772,62 @@ def _print_stats_inner(conn, model=None, suite=None, per_question=False):
     print(f"{'='*W}\n")
 
 
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def load_questions(suites, limit=None, cruxeval_x_path=None):
+    """Load and return all questions from the given suites."""
+    print("\n⏳ Loading datasets...")
+    all_questions = []
+    for suite in suites:
+        print(f"  Loading {suite}...")
+        loader = SUITE_REGISTRY[suite]["loader"]
+        qs = loader(limit=limit, cruxeval_x_path=cruxeval_x_path)
+        print(f"    → {len(qs)} questions")
+        all_questions.extend(qs)
+    return all_questions
+
+
+def load_run_configs(config_path):
+    """Load multi-run configurations from a JSON file.
+
+    Expected format::
+
+        {
+          "defaults": {                    // optional, applied to every run
+            "base_url": "http://...",
+            "workers": 4,
+            "db": "bench_stats.db"
+          },
+          "runs": [
+            {
+              "label":       "llama3 greedy",   // optional display name
+              "model":       "llama3",
+              "temperature": 0.0,
+              "seed":        42,                // omit or -1 = random
+              "suites":      ["mmlu_cs"],
+              "limit":       100,
+              "workers":     4,
+              "repeat":      3                  // how many times to repeat
+            },
+            { "model": "qwen2.5-coder:7b", "temperature": 0.8, "repeat": 2 }
+          ]
+        }
+    """
+    with open(config_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    if "runs" not in data:
+        raise ValueError(f"Config file {config_path!r} must contain a 'runs' list")
+
+    defaults = data.get("defaults", {})
+    configs = [{**defaults, **run} for run in data["runs"]]
+
+    if not configs:
+        raise ValueError(f"Config file {config_path!r}: 'runs' list is empty")
+
+    return configs
+
+
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -775,11 +839,12 @@ def main():
             "  python bench.py --model llama3\n"
             "  python bench.py --model llama3 --temperature 0.0\n"
             "  python bench.py --model llama3 --temperature 0.5 --suites mmlu_cs\n"
+            "  python bench.py --config bench_configs.json\n"
             "  python bench.py --stats\n"
             "  python bench.py --stats --model llama3 --suite-filter mmlu_cs\n"
         ),
     )
-    # --model is optional here; validated manually below (not needed for --stats / --list-suites)
+    # --model is optional: not needed for --stats / --list-suites / --config
     p.add_argument("--model", default=None)
     p.add_argument("--base-url", default=DEFAULT_BASE_URL)
     p.add_argument("--suites", nargs="+", default=DEFAULT_SUITES,
@@ -787,12 +852,13 @@ def main():
     p.add_argument("--limit", type=int, default=None, help="Max questions per suite")
     p.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     p.add_argument("--verbose", action="store_true")
-    p.add_argument("--output", type=str, default=None)
+    p.add_argument("--output", type=str, default=None,
+                   help="Output JSON file (single-run mode only)")
     p.add_argument("--list-suites", action="store_true")
     p.add_argument("--cruxeval-x-path", type=str, default=None,
                    help="Path to cruxeval-x/data/cruxeval_preprocessed")
     p.add_argument("--seed", type=int, default=DEFAULT_SEED,
-                   help="RNG seed for deterministic sampling")
+                   help="RNG seed (-1 = random, any non-negative = fixed)")
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
                    help="Per-request HTTP timeout in seconds")
     p.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES,
@@ -801,6 +867,8 @@ def main():
                    help=f"Sampling temperature (default: {DEFAULT_TEMPERATURE})")
     p.add_argument("--db", type=str, default=DEFAULT_DB,
                    help=f"SQLite database for statistics (default: {DEFAULT_DB})")
+    p.add_argument("--config", type=str, default=None,
+                   help="JSON config file with multiple run configurations")
     p.add_argument("--stats", action="store_true",
                    help="Show temperature statistics from the database and exit")
     p.add_argument("--suite-filter", type=str, default=None,
@@ -822,18 +890,106 @@ def main():
                     per_question=args.per_question)
         return
 
+    # ── Multi-config mode ────────────────────────────────────────────────────
+    if args.config:
+        try:
+            configs = load_run_configs(args.config)
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            p.error(f"Cannot load config file: {e}")
+
+        total_runs = sum(c.get("repeat", 1) for c in configs)
+        run_num = 0
+        summaries = []
+
+        for cfg_idx, cfg in enumerate(configs):
+            model = cfg.get("model") or args.model
+            if not model:
+                print(f"\n  ✗ Config #{cfg_idx+1} has no 'model' field — skipping")
+                continue
+
+            base_url    = cfg.get("base_url",        args.base_url)
+            suites      = cfg.get("suites",           args.suites)
+            limit       = cfg.get("limit",            args.limit)
+            workers     = cfg.get("workers",          args.workers)
+            verbose     = cfg.get("verbose",          args.verbose)
+            seed        = cfg.get("seed",             args.seed)
+            timeout     = cfg.get("timeout",          args.timeout)
+            max_retries = cfg.get("max_retries",      args.max_retries)
+            temperature = cfg.get("temperature",      args.temperature)
+            db          = cfg.get("db",               args.db)
+            repeat      = max(1, int(cfg.get("repeat", 1)))
+            cx_path     = cfg.get("cruxeval_x_path",  args.cruxeval_x_path)
+            label       = cfg.get("label",            f"config-{cfg_idx+1}")
+
+            print(f"\n{'#'*65}")
+            print(f"  Config {cfg_idx+1}/{len(configs)}: {label}")
+            print(f"  model={model}  temp={temperature}  seed: {seed_label(seed)}  repeat={repeat}x")
+            print(f"{'#'*65}")
+
+            questions = load_questions(suites, limit, cx_path)
+            if not questions:
+                print("  No questions loaded — skipping")
+                continue
+
+            print(f"\n🔌 Checking {base_url}...")
+            try:
+                r = requests.get(f"{base_url.rstrip('/')}/models", timeout=5)
+                r.raise_for_status()
+                print("  ✓ Connected")
+            except Exception as e:
+                print(f"  ✗ Cannot reach API: {e} — skipping")
+                continue
+
+            for rep in range(repeat):
+                run_num += 1
+                if repeat > 1:
+                    print(f"\n  ── Repeat {rep+1}/{repeat}  (overall run {run_num}/{total_runs}) ──")
+
+                timestamp = int(time.time())
+                db_conn, run_id = create_run(db, model, temperature, seed, suites, timestamp)
+                print(f"  Recording results live → {db}  (run #{run_id})")
+
+                summary = run_benchmark(
+                    base_url, model, questions,
+                    workers=workers, verbose=verbose, seed=seed,
+                    timeout=timeout, temperature=temperature,
+                    max_retries=max_retries,
+                    db_conn=db_conn, run_id=run_id,
+                )
+                print_report(summary)
+                finish_run(db_conn, run_id, summary["total"], summary["correct"], summary["accuracy"])
+                print(f"Statistics saved to {db}")
+
+                out_path = f"results_{model}_{timestamp}.json"
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(summary, f, indent=2, ensure_ascii=False)
+                print(f"Results saved to {out_path}")
+
+                summaries.append({**summary, "_label": label, "_repeat": rep + 1})
+
+        # ── Multi-config summary table ───────────────────────────────────────
+        if len(summaries) > 1:
+            W = 70
+            print(f"\n{'='*W}")
+            print(f"  MULTI-CONFIG SUMMARY  ({len(summaries)} runs total)")
+            print(f"{'='*W}")
+            print(f"  {'Label':<22} {'Model':<22} {'Temp':>5} {'Seed':<24} {'Score':>12}")
+            print(f"  {'─'*22} {'─'*22} {'─'*5} {'─'*24} {'─'*12}")
+            for s in summaries:
+                lbl  = s.get("_label", "")[:22]
+                rep_sfx = f" #{s['_repeat']}" if s.get("_repeat", 1) > 1 else ""
+                sl   = seed_label(s.get("seed", -1))[:24]
+                score = f"{s['correct']}/{s['total']} ({s['accuracy']*100:.1f}%)"
+                print(f"  {lbl + rep_sfx:<22} {s['model']:<22} {s.get('temperature', 0):>5.2f} {sl:<24} {score:>12}")
+            print(f"{'='*W}\n")
+
+        return
+
+    # ── Single-run mode (original behaviour) ────────────────────────────────
     if not args.model:
-        p.error("--model is required when running a benchmark (omit only for --stats / --list-suites)")
+        p.error("--model is required (or use --config for multi-run mode)")
 
-    print("\n⏳ Loading datasets...")
-    all_questions = []
-    for suite in args.suites:
-        print(f"  Loading {suite}...")
-        loader = SUITE_REGISTRY[suite]["loader"]
-        qs = loader(limit=args.limit, cruxeval_x_path=args.cruxeval_x_path)
-        print(f"    → {len(qs)} questions")
-        all_questions.extend(qs)
-
+    all_questions = load_questions(args.suites, args.limit, args.cruxeval_x_path)
     if not all_questions:
         print("No questions loaded!")
         return

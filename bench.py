@@ -291,7 +291,7 @@ def load_mmlu_ml(limit=None, **kw):
 
 # ─── LLM Client ──────────────────────────────────────────────────────────────
 
-def query_llm(base_url, model, prompt, system="", timeout=DEFAULT_TIMEOUT, max_tokens=None, seed=DEFAULT_SEED):
+def query_llm(base_url, model, prompt, system="", timeout=DEFAULT_TIMEOUT, seed=DEFAULT_SEED):
     url = f"{base_url.rstrip('/')}/chat/completions"
     messages = []
     if system:
@@ -302,10 +302,8 @@ def query_llm(base_url, model, prompt, system="", timeout=DEFAULT_TIMEOUT, max_t
         "model": model,
         "messages": messages,
         "temperature": 1.0,
-        "seed": seed,  # deterministic output across runs
+        "seed": seed,
     }
-    if max_tokens is not None:
-        body["max_tokens"] = max_tokens
 
     t0 = time.perf_counter()
     try:

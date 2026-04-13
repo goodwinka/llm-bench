@@ -2,39 +2,43 @@
   "_comment": "Example multi-run config for bench.py --config bench_configs.json",
 
   "defaults": {
-    "base_url":    "http://localhost:11435/v1",
-    "workers":     4,
-    "timeout":     15,
-    "max_retries": 3,
-    "db":          "bench_stats.db"
+    "base_url":         "http://localhost:11435/v1",
+    "workers":          4,
+    "timeout":          15,
+    "max_retries":      3,
+    "db":               "bench_stats.db",
+    "top_p":            0.8,
+    "top_k":            20,
+    "min_p":            0.0,
+    "presence_penalty": 1.5
   },
 
   "runs": [
     {
-      "label":       "llama3 — greedy, fixed seed",
-      "model":       "llama3",
-      "temperature": 0.0,
-      "seed":        42,
-      "suites":      ["mmlu_cs"],
-      "limit":       100,
-      "repeat":      3
+      "label":            "llama3 — greedy, fixed seed",
+      "model":            "llama3",
+      "temperature":      0.0,
+      "seed":             42,
+      "suites":           ["mmlu_cs"],
+      "limit":            100,
+      "repeat":           3
     },
     {
-      "label":       "llama3 — sampling, random seed",
-      "model":       "llama3",
-      "temperature": 0.8,
-      "seed":        -1,
-      "suites":      ["cruxeval", "mmlu_cs"],
-      "repeat":      2
+      "label":            "llama3 — sampling, random seed",
+      "model":            "llama3",
+      "temperature":      0.8,
+      "seed":             -1,
+      "suites":           ["cruxeval", "mmlu_cs"],
+      "repeat":           2
     },
     {
-      "label":       "qwen2.5-coder:7b — all suites",
-      "model":       "qwen2.5-coder:7b",
-      "temperature": 0.0,
-      "seed":        0,
-      "suites":      ["cruxeval", "mmlu_cs", "mmlu_machine_learning"],
-      "workers":     8,
-      "repeat":      1
+      "label":            "qwen2.5-coder:7b — all suites",
+      "model":            "qwen2.5-coder:7b",
+      "temperature":      0.0,
+      "seed":             0,
+      "suites":           ["cruxeval", "mmlu_cs", "mmlu_machine_learning"],
+      "workers":          8,
+      "repeat":           1
     }
   ]
 }

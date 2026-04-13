@@ -51,14 +51,18 @@ except ImportError:
 
 # ─── Defaults ────────────────────────────────────────────────────────────────
 
-DEFAULT_BASE_URL   = "http://localhost:11435/v1"
-DEFAULT_WORKERS    = 1
-DEFAULT_TIMEOUT    = 15
-DEFAULT_MAX_RETRIES = 3
-DEFAULT_SEED       = -1
-DEFAULT_SUITES     = ["cruxeval", "mmlu_cs"]
-DEFAULT_TEMPERATURE = 1.0
-DEFAULT_DB         = "bench_stats.db"
+DEFAULT_BASE_URL        = "http://localhost:11435/v1"
+DEFAULT_WORKERS         = 1
+DEFAULT_TIMEOUT         = 15
+DEFAULT_MAX_RETRIES     = 3
+DEFAULT_SEED            = -1
+DEFAULT_SUITES          = ["cruxeval", "mmlu_cs"]
+DEFAULT_TEMPERATURE     = 0.6
+DEFAULT_TOP_P           = 0.95
+DEFAULT_TOP_K           = 20
+DEFAULT_MIN_P           = 0.0
+DEFAULT_PRESENCE_PENALTY = 1.5
+DEFAULT_DB              = "bench_stats.db"
 
 # HTTP status codes that warrant a retry (transient server errors)
 _RETRY_STATUS_CODES = {502, 503, 504}
@@ -304,7 +308,9 @@ def load_mmlu_ml(limit=None, **kw):
 # ─── LLM Client ──────────────────────────────────────────────────────────────
 
 def query_llm(base_url, model, prompt, system="", timeout=DEFAULT_TIMEOUT, seed=DEFAULT_SEED,
-              temperature=DEFAULT_TEMPERATURE, max_retries=DEFAULT_MAX_RETRIES):
+              temperature=DEFAULT_TEMPERATURE, max_retries=DEFAULT_MAX_RETRIES,
+              top_p=DEFAULT_TOP_P, top_k=DEFAULT_TOP_K,
+              min_p=DEFAULT_MIN_P, presence_penalty=DEFAULT_PRESENCE_PENALTY):
     url = f"{base_url.rstrip('/')}/chat/completions"
     messages = []
     if system:
@@ -316,6 +322,10 @@ def query_llm(base_url, model, prompt, system="", timeout=DEFAULT_TIMEOUT, seed=
         "messages": messages,
         "temperature": temperature,
         "seed": seed,
+        "top_p": top_p,
+        "top_k": top_k,
+        "min_p": min_p,
+        "presence_penalty": presence_penalty,
     }
 
     t0 = time.perf_counter()
@@ -396,7 +406,9 @@ SYSTEM_PROMPT = (
 
 def run_benchmark(base_url, model, questions, workers=DEFAULT_WORKERS, verbose=False, seed=DEFAULT_SEED,
                   timeout=DEFAULT_TIMEOUT, temperature=DEFAULT_TEMPERATURE,
-                  max_retries=DEFAULT_MAX_RETRIES, db_conn=None, run_id=None):
+                  max_retries=DEFAULT_MAX_RETRIES, db_conn=None, run_id=None,
+                  top_p=DEFAULT_TOP_P, top_k=DEFAULT_TOP_K,
+                  min_p=DEFAULT_MIN_P, presence_penalty=DEFAULT_PRESENCE_PENALTY):
     total = len(questions)
     results = []
     correct = 0
@@ -413,7 +425,8 @@ def run_benchmark(base_url, model, questions, workers=DEFAULT_WORKERS, verbose=F
     def process(iq):
         i, q = iq
         resp = query_llm(base_url, model, q["prompt"], SYSTEM_PROMPT, timeout=timeout, seed=seed,
-                         temperature=temperature, max_retries=max_retries)
+                         temperature=temperature, max_retries=max_retries,
+                         top_p=top_p, top_k=top_k, min_p=min_p, presence_penalty=presence_penalty)
         ok = check_answer(q["expected"], resp["answer"], q["task"]) if not resp["error"] else False
         return i, q, resp, ok
 
@@ -459,6 +472,7 @@ def run_benchmark(base_url, model, questions, workers=DEFAULT_WORKERS, verbose=F
 
     return {
         "model": model, "temperature": temperature, "seed": seed,
+        "top_p": top_p, "top_k": top_k, "min_p": min_p, "presence_penalty": presence_penalty,
         "total": total, "correct": correct,
         "accuracy": correct / total if total else 0,
         "errors": errors,
@@ -471,6 +485,8 @@ def print_report(s):
     print(f"\n\n{'='*65}")
     print(f"  RESULTS — {s['model']}")
     print(f"  temperature={s.get('temperature', '?')}  seed: {seed_label(s.get('seed', -1))}")
+    print(f"  top_p={s.get('top_p', '?')}  top_k={s.get('top_k', '?')}  "
+          f"min_p={s.get('min_p', '?')}  presence_penalty={s.get('presence_penalty', '?')}")
     print(f"{'='*65}")
     print(f"  Total:  {s['correct']}/{s['total']}  ({s['accuracy']*100:.1f}%)  "
           f"avg {s['avg_latency']:.2f}s/question")
@@ -492,15 +508,19 @@ def init_db(db_path):
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS runs (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            model       TEXT    NOT NULL,
-            temperature REAL    NOT NULL,
-            seed        INTEGER,
-            timestamp   INTEGER NOT NULL,
-            suites      TEXT,
-            total       INTEGER,
-            correct     INTEGER,
-            accuracy    REAL
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            model            TEXT    NOT NULL,
+            temperature      REAL    NOT NULL,
+            seed             INTEGER,
+            top_p            REAL,
+            top_k            INTEGER,
+            min_p            REAL,
+            presence_penalty REAL,
+            timestamp        INTEGER NOT NULL,
+            suites           TEXT,
+            total            INTEGER,
+            correct          INTEGER,
+            accuracy         REAL
         )
     """)
     conn.execute("""
@@ -528,16 +548,29 @@ def init_db(db_path):
             conn.commit()
         except sqlite3.OperationalError:
             pass  # column already exists
+    for col, typ in [
+        ("top_p", "REAL"), ("top_k", "INTEGER"),
+        ("min_p", "REAL"), ("presence_penalty", "REAL"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {typ}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
     return conn
 
 
-def create_run(db_path, model, temperature, seed, suites, timestamp):
+def create_run(db_path, model, temperature, seed, suites, timestamp,
+               top_p=DEFAULT_TOP_P, top_k=DEFAULT_TOP_K,
+               min_p=DEFAULT_MIN_P, presence_penalty=DEFAULT_PRESENCE_PENALTY):
     """Open DB, insert a run record, return (conn, run_id)."""
     conn = init_db(db_path)
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO runs (model, temperature, seed, timestamp, suites) VALUES (?,?,?,?,?)",
-        (model, temperature, seed, timestamp, json.dumps(sorted(suites)))
+        "INSERT INTO runs (model, temperature, seed, top_p, top_k, min_p, presence_penalty, timestamp, suites) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (model, temperature, seed, top_p, top_k, min_p, presence_penalty,
+         timestamp, json.dumps(sorted(suites)))
     )
     conn.commit()
     return conn, cur.lastrowid
@@ -865,6 +898,14 @@ def main():
                    help=f"Max retries for transient server errors 502/503/504 (default: {DEFAULT_MAX_RETRIES})")
     p.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE,
                    help=f"Sampling temperature (default: {DEFAULT_TEMPERATURE})")
+    p.add_argument("--top-p", type=float, default=DEFAULT_TOP_P,
+                   help=f"Top-p (nucleus) sampling (default: {DEFAULT_TOP_P})")
+    p.add_argument("--top-k", type=int, default=DEFAULT_TOP_K,
+                   help=f"Top-k sampling (default: {DEFAULT_TOP_K})")
+    p.add_argument("--min-p", type=float, default=DEFAULT_MIN_P,
+                   help=f"Min-p sampling (default: {DEFAULT_MIN_P})")
+    p.add_argument("--presence-penalty", type=float, default=DEFAULT_PRESENCE_PENALTY,
+                   help=f"Presence penalty (default: {DEFAULT_PRESENCE_PENALTY})")
     p.add_argument("--db", type=str, default=DEFAULT_DB,
                    help=f"SQLite database for statistics (default: {DEFAULT_DB})")
     p.add_argument("--config", type=str, default=None,
@@ -912,11 +953,15 @@ def main():
             limit       = cfg.get("limit",            args.limit)
             workers     = cfg.get("workers",          args.workers)
             verbose     = cfg.get("verbose",          args.verbose)
-            seed        = cfg.get("seed",             args.seed)
-            timeout     = cfg.get("timeout",          args.timeout)
-            max_retries = cfg.get("max_retries",      args.max_retries)
-            temperature = cfg.get("temperature",      args.temperature)
-            db          = cfg.get("db",               args.db)
+            seed             = cfg.get("seed",             args.seed)
+            timeout          = cfg.get("timeout",          args.timeout)
+            max_retries      = cfg.get("max_retries",      args.max_retries)
+            temperature      = cfg.get("temperature",      args.temperature)
+            top_p            = cfg.get("top_p",            args.top_p)
+            top_k            = cfg.get("top_k",            args.top_k)
+            min_p            = cfg.get("min_p",            args.min_p)
+            presence_penalty = cfg.get("presence_penalty", args.presence_penalty)
+            db               = cfg.get("db",               args.db)
             repeat      = max(1, int(cfg.get("repeat", 1)))
             cx_path     = cfg.get("cruxeval_x_path",  args.cruxeval_x_path)
             label       = cfg.get("label",            f"config-{cfg_idx+1}")
@@ -946,7 +991,9 @@ def main():
                     print(f"\n  ── Repeat {rep+1}/{repeat}  (overall run {run_num}/{total_runs}) ──")
 
                 timestamp = int(time.time())
-                db_conn, run_id = create_run(db, model, temperature, seed, suites, timestamp)
+                db_conn, run_id = create_run(db, model, temperature, seed, suites, timestamp,
+                                             top_p=top_p, top_k=top_k,
+                                             min_p=min_p, presence_penalty=presence_penalty)
                 print(f"  Recording results live → {db}  (run #{run_id})")
 
                 summary = run_benchmark(
@@ -955,6 +1002,8 @@ def main():
                     timeout=timeout, temperature=temperature,
                     max_retries=max_retries,
                     db_conn=db_conn, run_id=run_id,
+                    top_p=top_p, top_k=top_k,
+                    min_p=min_p, presence_penalty=presence_penalty,
                 )
                 print_report(summary)
                 finish_run(db_conn, run_id, summary["total"], summary["correct"], summary["accuracy"])
@@ -1005,7 +1054,9 @@ def main():
 
     timestamp = int(time.time())
     db_conn, run_id = create_run(
-        args.db, args.model, args.temperature, args.seed, args.suites, timestamp
+        args.db, args.model, args.temperature, args.seed, args.suites, timestamp,
+        top_p=args.top_p, top_k=args.top_k,
+        min_p=args.min_p, presence_penalty=args.presence_penalty,
     )
     print(f"  Recording results live → {args.db}  (run #{run_id})")
 
@@ -1015,6 +1066,8 @@ def main():
         timeout=args.timeout, temperature=args.temperature,
         max_retries=args.max_retries,
         db_conn=db_conn, run_id=run_id,
+        top_p=args.top_p, top_k=args.top_k,
+        min_p=args.min_p, presence_penalty=args.presence_penalty,
     )
     print_report(summary)
 
